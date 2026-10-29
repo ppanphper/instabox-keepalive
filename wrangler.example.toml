@@ -14,3 +14,8 @@ KEEPALIVE_INTERVAL_MINUTES = "15"
 # keep_vars 保留控制台变量；升级已有部署前仍须核对 Cron、日志、域名等其他设置。
 # 面板密码和 Redis 凭据也通过 wrangler secret put 设置。一个 Cron 管理全部机器。
 # WORKER_SUBREQUEST_LIMIT 默认 50；仅在套餐实际允许更高额度时调整。
+
+# 可选网页添加账号：生成一次 32 字节随机主密钥（64 位十六进制），
+# 使用 wrangler secret put ACCOUNT_ENCRYPTION_KEY 保存。不要在此文件填值。
+# 保存网页账号后须保留并备份该密钥；随意更换会导致旧账号无法解密。
+# 启用后可直接在面板填写新账号 Key；现有 INSTABOX_API_KEY* 继续有效。

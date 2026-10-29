@@ -12,7 +12,8 @@ InstaBox 免费机器默认空闲 30 分钟后自动暂停；是否可以调整�
 
 ## 功能
 
-- 每个账号配置一个 Cloudflare Secret，首次部署即可接入多个账号
+- 点击「添加账号」，填写 API Key 自动发现该账号已有机器；Key 加密保存
+- 也可用每个账号一个 Cloudflare Secret 的方式接入，兼容已有配置
 - 多账号机器列表与实时状态（运行中 / 已暂停 / 已停止 / 操作过渡态），自动读取全部分页
 - 每台机器显示所属账号；一个账号请求失败不影响其他账号
 - 冷却截止时间与自动重试状态，冷却中不调用启动、唤醒或续租
@@ -69,7 +70,7 @@ URL 使用 `https://…upstash.io` 形式的 REST 根地址，不填 `redis://` 
 
 ![Upstash 免费额度](images/upstash-free-tier.png)
 
-## 部署：一次配置全部账号
+## 部署：配置账号与网页添加功能
 
 **一个账号填一个 API Key，面板自动发现该账号下所有机器。** 不用填写机器 ID、SSH 地址或代理信息，也不用先部署单账号版本。账号的机器数量由 InstaBox 套餐决定。
 
@@ -83,6 +84,31 @@ URL 使用 `https://…upstash.io` 形式的 REST 根地址，不填 `redis://` 
 已有面板不要同时保留第一账号的 `INSTABOX_API_KEY` 与 `_1` 两份配置，也不要为了统一编号而改名：旧名对应账号 ID `default`，原保活设置属于它；`_1` 对应新的账号 ID `1`。
 
 **代码和变量必须配套更新。** 旧单账号代码只读取 `INSTABOX_API_KEY`，仅添加 `_1`、`_2` 不会获得多账号能力。使用本说明同版本的完整 `worker.js`；当前请求封装使用 Workers 支持的 `redirect: "manual"`，不要使用曾导致所有外部请求失败的 `redirect: "error"` 版本。
+
+### 启用网页「添加账号」
+
+已有面板升级后，管理员只需额外配置一次 `ACCOUNT_ENCRYPTION_KEY`，以后新增账号直接在面板填写 Key，无需再进 Cloudflare。
+
+1. 完整部署本版本 `worker.js`，保留原账号 Secrets、Redis、面板密码和 Cron。
+2. 在本机生成 **32 字节随机密钥**，以下命令输出 64 位十六进制字符串：
+
+   ```bash
+   python3 -c 'import secrets; print(secrets.token_hex(32))'
+   ```
+
+3. 在 Cloudflare **Settings → Variables and Secrets** 添加 **Secret** `ACCOUNT_ENCRYPTION_KEY`，粘贴生成的值，保存部署。使用 CLI 时运行 `wrangler secret put ACCOUNT_ENCRYPTION_KEY`，交互粘贴；不要写入 `wrangler.toml` 或仓库。
+4. 登录面板，点击「添加账号」，填写该账号的 API Key（`ibk_` 开头）；名称可选。点击「验证并添加」后，面板发现该账号全部已有机器并刷新列表。
+5. 确认机器所属账号，按需开启保活。新增机器默认关闭保活；添加账号不会创建机器、启动机器或安装监控探针。
+
+Key 是**账号工作区级**凭据，不是单台机器的凭据。同一工作区新增机器只需刷新；另一个账号或工作区才需要另一个 Key。Key 至少需要 `machines:read` 才能通过添加校验；保活、生命周期操作和终端需要 `machines:write`（包含读取）。添加时只做只读校验，不试运行机器操作，因此校验成功不代表写权限已通过实测。
+
+没有机器的有效账号也可以添加，机器创建后刷新即可发现。相同 Key 或同一工作区的另一个 Key 会被拒绝，避免重复接入。若已有 Secrets 账号的 Key 已失效，请先修复原 Secret，否则不能可靠判断新 Key 是否与已有账号重复。
+
+**保存与恢复**：网页账号使用 AES-256-GCM 加密后存入现有 Redis，主密钥只在 Cloudflare Secret 中；浏览器不持久化账号 Key，接口和日志不返回 Key。备份时同时保管 Redis 数据和主密钥，分开保存。不要随意重建、删除或更换 `ACCOUNT_ENCRYPTION_KEY`：没有原值就无法解密网页账号。更换面板登录密码不影响账号解密。
+
+本版本提供添加，不提供网页修改／删除账号或轮换 Key。旧 Secrets 账号继续按原变量轮换 Key，保持账号 ID。网页账号需要轮换或迁移时，先备份并按原工作区及稳定 ID 处理，不能用「添加」覆盖。每个面板最多保存 32 个网页账号；这不是 32 台持续保活的容量保证，请看下方调度容量说明。
+
+不配置主密钥时，原 Secrets 模式仍可用，添加弹窗会提示尚未启用。新建面板也可只配置面板密码、Redis 与主密钥，再从网页接入第一个账号，无需提前填写 `INSTABOX_API_KEY_*`。
 
 ### 全新部署：Cloudflare 网页控制台
 
@@ -102,7 +128,7 @@ URL 使用 `https://…upstash.io` 形式的 REST 根地址，不填 `redis://` 
 4. 在 Worker 的 **Observability / Logs** 开启日志记录，以便查看定时执行结果。
 5. 打开面板，输入 `ADMIN_PASSWORD` 登录。确认机器列表、配额和日志加载正常，再为需要保持运行的机器开启「自动保活」。
 
-以后增加账号，只需在同一个 Worker 增加 `INSTABOX_API_KEY_3` 等 Secret，保存部署后刷新面板。同一账号下增加机器时，Key 不变，刷新即可发现；新机器默认不开启保活。添加 Key 本身不会创建机器，账号下没有机器时不会出现新机器卡片。
+以后增加账号，可按上节启用网页添加功能；也可继续在同一个 Worker 增加 `INSTABOX_API_KEY_3` 等 Secret，保存部署后刷新面板。同一账号下增加机器时，Key 不变，刷新即可发现；新机器默认不开启保活。添加 Key 本身不会创建机器，账号下没有机器时不会出现新机器卡片。
 
 可选的普通文本变量 `INSTABOX_ACCOUNT_NAME_1`、`INSTABOX_ACCOUNT_NAME_2` 用于自定义显示名称，未设置时显示「账号 1」「账号 2」。Key 始终使用 **Secret** 类型。
 
@@ -172,11 +198,12 @@ wrangler versions deploy VERSION_ID@100 --config wrangler.toml
 
 ## 配置参考与旧版本兼容
 
-日常只需使用上面的编号 Secret。下面是可选配置和旧部署迁移规则。
+网页添加和编号 Secrets 可以同时使用；已有账号保留原方式。下面是配置项和旧部署迁移规则。
 
 | 变量 | 用途 |
 |---|---|
-| `INSTABOX_API_KEY_1`、`_2`… | 推荐配置，每个账号一个 Secret |
+| `INSTABOX_API_KEY_1`、`_2`… | 直接在 Cloudflare 配置账号时，每个账号一个 Secret |
+| `ACCOUNT_ENCRYPTION_KEY` | 可选 Secret，64 位十六进制随机主密钥，开启网页账号加密存储 |
 | `INSTABOX_ACCOUNT_NAME_1`、`_2`… | 可选，普通文本，自定义账号名称 |
 | `INSTABOX_API_KEY` | 兼容旧版，对应稳定账号 ID `default` |
 | `INSTABOX_ACCOUNTS` | 可选 Secret，JSON 账号数组，与旧配置兼容 |
@@ -202,7 +229,7 @@ wrangler versions deploy VERSION_ID@100 --config wrangler.toml
 
 ## 定时任务与机器数量
 
-只需一个 Cron。每轮处理所有已开启保活的账号／机器，达到请求预算时自动分批，下轮从上次处理位置继续。关闭保活的机器不消耗定时续租请求。
+只需一个 Cron。每轮处理所有已开启保活的账号／机器，达到请求预算时自动分批，下轮从上次处理位置继续。关闭保活的机器不消耗定时续租请求。启用网页账号后，每个需要账号列表的 HTTP／Cron 执行额外读取一次加密注册表；Cron 的初始请求数从 1 增加到 2，仍受总预算约束。
 
 默认 **`*/15 * * * *`**，成功续租有效 3600 秒。冷却结束后也要等待调度；少量机器通常等下一轮，分批情况下可能要等后续轮次。频率更高不能解除平台冷却或运行上限。
 
@@ -269,12 +296,22 @@ Worker 用对应账号的 Key 调用官方控制台当前使用的 `/v1/machines
 
 | Key | 类型 | 内容 |
 |---|---|---|
+| `instabox:accounts:v1` | Hash | 网页账号注册表；field 是工作区 ID 的 SHA-256 前 24 位加 `web_`，value 为含随机 IV 的 AES-GCM 密文信封，名称／Key／工作区 ID 一起加密 |
 | `instabox:machines` | Hash | field 为 `账号ID:机器ID`，value 为 JSON：名称、保活开关、租约／冷却到期时间、上次执行结果 |
 | `instabox:lock:<账号ID>:<机器ID>` | String | 操作锁的随机 token，最多保留 600 秒 |
 | `instabox:scheduler-cursor` | String | 最近尝试处理的 `账号ID:机器ID`，让下轮从后面的机器继续 |
 | `instabox:logs` | List | 保活与操作日志，`LPUSH` + `LTRIM` 保留最近 200 条 |
 
 ## 常见问题
+
+**「添加账号」提示尚未启用**
+
+确认已部署完整新版，并将 `ACCOUNT_ENCRYPTION_KEY` 保存为恰好 64 位十六进制的 Secret。它是面板自己生成的加密主密钥，不是 InstaBox API Key，也不是面板密码。
+
+**网页账号无法解密／账号存储暂不可用**
+
+先核对 Redis 连通性、读写和 `EVAL` 权限，再核对主密钥是否与保存账号时一致。不要清空 Redis 或重新生成主密钥。受影响的网页账号会暂停加载，页面显示错误，新增写入被拒绝；其余可解密账号和原 Secrets 账号继续处理。Redis 整体故障时保活本身也会受影响。
+
 
 **添加了第二账号 Key，却仍只有一台机器**
 
@@ -312,6 +349,10 @@ Worker 用对应账号的 Key 调用官方控制台当前使用的 `/v1/machines
 
 Cloudflare Worker 通过 HTTPS 调用官方控制 API，管理机器状态和活动租约；不会把 InstaBox 虚拟机用作流量转发节点。
 
+## 设计与实现说明
+
+界面约定见 [DESIGN.md](DESIGN.md)，实现说明按主题分为 [账号配置与加密接入](docs/account-management.md)、[保活状态与调度](docs/keepalive.md)、[网页终端 API 与协议](docs/web-terminal.md)。
+
 ## 本地验证
 
 需要 Node.js 22 或更新版本，没有 npm 依赖要安装：
@@ -322,6 +363,8 @@ npm test
 ```
 
 测试使用模拟 InstaBox API 和 Redis，不连接实际账号，也不会启动、暂停或删除真实机器。GitHub Actions 对 PR 运行相同检查。界面仍内嵌在 `worker.js`，网页部署只需该文件，`package.json` 和测试不影响部署方式。
+
+新增账号测试覆盖加密持久化、旧账号兼容、工作区去重、并发添加、无权限／分页失败、损坏密文隔离、零机器账号及新账号终端与 Cron 路由。
 
 Node 测试不能代替 Workers 运行时验证。本次 redirect 修复还用真实 workerd 复现原错误，并验证了正常请求与 302 不跟随行为；后续修改 fetch/Request/Response 等平台接口时，应继续在 Wrangler dev 或 Miniflare 中用测试数据验证，再做实际部署验收。
 
