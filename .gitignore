@@ -12,6 +12,7 @@ wrangler.toml
 
 # 工具与临时产物
 .workbuddy-ai/
+.wrangler/
 preview.html
 *.log
 work/
