@@ -1,6 +1,7 @@
 name = "instabox-panel"
 main = "worker.js"
 compatibility_date = "2026-10-01"
+keep_vars = true
 
 [triggers]
 crons = ["*/15 * * * *"]
@@ -8,4 +9,8 @@ crons = ["*/15 * * * *"]
 [vars]
 KEEPALIVE_INTERVAL_MINUTES = "15"
 
-# API Key、账号 JSON、面板密码和 Redis 凭据均通过 wrangler secret put 设置。
+# 每个账号一个 Secret：wrangler secret put INSTABOX_API_KEY_1（第二个账号用 _2，以此类推）。
+# 已有单账号面板保留 INSTABOX_API_KEY，直接增加 _2；不要同时重复配置旧名和 _1。
+# keep_vars 保留控制台变量；升级已有部署前仍须核对 Cron、日志、域名等其他设置。
+# 面板密码和 Redis 凭据也通过 wrangler secret put 设置。一个 Cron 管理全部机器。
+# WORKER_SUBREQUEST_LIMIT 默认 50；仅在套餐实际允许更高额度时调整。

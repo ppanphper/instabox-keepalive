@@ -9,8 +9,10 @@
  *
  * 环境变量（在 Worker 设置中配置）：
  *   INSTABOX_API_KEY        InstaBox 的 API 密钥（ibk_ 开头）
- *   INSTABOX_ACCOUNTS       其他账号的 JSON 数组：[{ id, name, apiKey }]
+ *   INSTABOX_API_KEY_1 / _2 / ... 每个账号一个 Secret，自动发现其全部机器
+ *   INSTABOX_ACCOUNTS       可选 JSON 数组：[{ id, name, apiKey }]
  *   KEEPALIVE_INTERVAL_MINUTES 定时任务分钟步长，默认 15，须与 Cron 一致
+ *   WORKER_SUBREQUEST_LIMIT 单次执行请求预算，默认 50（免费套餐）
  *   ADMIN_PASSWORD          面板登录密码
  *   UPSTASH_REDIS_REST_URL  Upstash Redis 的 REST 地址
  *   UPSTASH_REDIS_REST_TOKEN Upstash Redis 的 REST 令牌
@@ -28,10 +30,18 @@ const KEY_RE = /^ibk_[A-Za-z0-9_-]+$/;
 const MACHINE_RE = /^m_[A-Za-z0-9_-]+$/;
 const ACCOUNT_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const PENDING_STATES = new Set(["creating", "starting", "stopping", "suspending", "resuming", "deleting"]);
+const REQUEST_CONTEXT = Symbol("requestContext");
+const MACHINE_REQUEST_RESERVE = 11; // 含最多三次启动查询、409 重查、写回、解锁及异常日志
+const CURSOR_KEY = REDIS_PREFIX + ":scheduler-cursor";
 
 function getAccounts(env) {
   const accounts = [];
   if (env.INSTABOX_API_KEY) accounts.push({ id: "default", name: "默认账号", apiKey: env.INSTABOX_API_KEY });
+  for (const variable of Object.keys(env).filter((key) => key.startsWith("INSTABOX_API_KEY_")).sort()) {
+    const id = variable.slice("INSTABOX_API_KEY_".length);
+    if (!ACCOUNT_RE.test(id)) throw new Error("账号 Secret 后缀须为 1–32 位小写字母、数字、下划线或连字符");
+    accounts.push({ id, name: env["INSTABOX_ACCOUNT_NAME_" + id] || "账号 " + id, apiKey: env[variable] });
+  }
   if (env.INSTABOX_ACCOUNTS) {
     let configured;
     try { configured = JSON.parse(env.INSTABOX_ACCOUNTS); }
@@ -39,7 +49,7 @@ function getAccounts(env) {
     if (!Array.isArray(configured)) throw new Error("INSTABOX_ACCOUNTS 必须是 JSON 数组");
     accounts.push(...configured);
   }
-  if (!accounts.length) throw new Error("请配置 INSTABOX_API_KEY 或 INSTABOX_ACCOUNTS");
+  if (!accounts.length) throw new Error("请在 Cloudflare Secrets 添加 INSTABOX_API_KEY_1，每个账号填写一个 Key");
   const ids = new Set(), keys = new Set();
   return accounts.map((account, index) => {
     if (!account || typeof account.id !== "string" || !ACCOUNT_RE.test(account.id) || typeof account.apiKey !== "string" || !KEY_RE.test(account.apiKey)) {
@@ -58,6 +68,28 @@ function intervalMinutes(env) {
   return value;
 }
 
+function subrequestLimit(env) {
+  const value = Number(env.WORKER_SUBREQUEST_LIMIT || 50);
+  if (!Number.isInteger(value) || value < 20 || value > 10000) throw new Error("WORKER_SUBREQUEST_LIMIT 须为 20–10000 的整数，并且不超过套餐额度");
+  return value;
+}
+
+function scopedEnv(env, scheduled = false) {
+  return { ...env, [REQUEST_CONTEXT]: { used: 0, limit: subrequestLimit(env), deadline: scheduled ? Date.now() + 13 * 60000 : Infinity } };
+}
+
+async function budgetFetch(env, url, options) {
+  const context = env[REQUEST_CONTEXT];
+  if (context) {
+    if (context.used >= context.limit) throw new Error("已达到本次请求预算，请减少账号／分页数量或使用更高额度的 Worker");
+    if (Date.now() >= context.deadline) throw new Error("本轮执行时间已用尽，将在下轮继续");
+    context.used++;
+  }
+  const timeout = Math.max(1, Math.min(REQUEST_TIMEOUT_MS, (context?.deadline ?? Infinity) - Date.now()));
+  // Workers 仅支持 follow/manual；将 3xx 交给调用方按非成功状态处理，避免额外请求或转发凭据。
+  return fetch(url, { ...options, redirect: "manual", signal: AbortSignal.timeout(timeout) });
+}
+
 function configKey(accountId, machineId) { return accountId + ":" + machineId; }
 
 function safeMessage(value) { return String(value || "").replace(/ibk_[A-Za-z0-9_-]+/g, "[已隐藏密钥]"); }
@@ -68,14 +100,13 @@ function safeMessage(value) { return String(value || "").replace(/ibk_[A-Za-z0-9
 async function redis(env, commands) {
   let res;
   try {
-    res = await fetch(env.UPSTASH_REDIS_REST_URL + "/pipeline", {
+    res = await budgetFetch(env, env.UPSTASH_REDIS_REST_URL + "/pipeline", {
       method: "POST",
       headers: {
         Authorization: "Bearer " + env.UPSTASH_REDIS_REST_TOKEN,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(commands),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (e) {
     const timedOut = e && (e.name === "TimeoutError" || e.name === "AbortError");
@@ -111,25 +142,38 @@ function toHash(raw) {
 /** 旧 machineId 字段只归属 default；新 accountId:machineId 字段优先。 */
 async function loadConfigs(env) {
   const [raw] = await redis(env, [["HGETALL", REDIS_PREFIX + ":machines"]]);
+  return parseConfigs(raw);
+}
+
+function parseConfig(raw) {
+  try {
+    const config = JSON.parse(raw);
+    return config && typeof config === "object" && !Array.isArray(config) ? config : null;
+  } catch { return null; }
+}
+
+function parseConfigs(raw) {
   const out = {};
   const entries = Object.entries(toHash(raw));
   for (const [id, value] of entries.sort(([a], [b]) => Number(a.includes(":")) - Number(b.includes(":")))) {
     const key = MACHINE_RE.test(id) ? configKey("default", id) : id;
     const [accountId, machineId, extra] = key.split(":");
     if (extra !== undefined || !ACCOUNT_RE.test(accountId) || !MACHINE_RE.test(machineId)) continue;
-    try {
-      const config = JSON.parse(value);
-      if (config && typeof config === "object" && !Array.isArray(config)) out[key] = config;
-    } catch { /* 忽略坏数据 */ }
+    const config = parseConfig(value);
+    if (config) out[key] = config;
   }
   return out;
 }
 
 /** 写入单台机器的保活配置 */
-function saveConfig(env, accountId, machineId, config) {
+function configCommands(accountId, machineId, config) {
   const commands = [["HSET", REDIS_PREFIX + ":machines", configKey(accountId, machineId), JSON.stringify(config)]];
   if (accountId === "default") commands.push(["HDEL", REDIS_PREFIX + ":machines", machineId]);
-  return redis(env, commands);
+  return commands;
+}
+
+function saveConfig(env, accountId, machineId, config) {
+  return redis(env, configCommands(accountId, machineId, config));
 }
 
 /** 删除某台机器的保活配置（机器被删除时调用） */
@@ -140,12 +184,18 @@ function dropConfig(env, accountId, machineId) {
 }
 
 /** Cron 与手动操作共享每台机器的锁；故障时自动过期，释放时校验归属。 */
-async function withMachineLock(env, key, action) {
+async function withMachineLock(env, key, action, advanceCursor = false) {
   const lockKey = REDIS_PREFIX + ":lock:" + key;
   const token = crypto.randomUUID();
-  const [acquired] = await redis(env, [["SET", lockKey, token, "NX", "EX", "600"]]);
+  const [accountId, machineId] = key.split(":");
+  const commands = [["SET", lockKey, token, "NX", "EX", "600"], ["HGET", REDIS_PREFIX + ":machines", key]];
+  if (accountId === "default") commands.push(["HGET", REDIS_PREFIX + ":machines", machineId]);
+  // 在处理前推进游标；即使本轮超时或写回失败，后面的机器也不会一直饿死。
+  if (advanceCursor) commands.push(["SET", CURSOR_KEY, key]);
+  const [acquired, current, legacy] = await redis(env, commands);
   if (acquired !== "OK") return { locked: true };
-  try { return await action(); }
+  const config = parseConfig(current) || (accountId === "default" ? parseConfig(legacy) : null);
+  try { return await action(config); }
   finally {
     await redis(env, [["EVAL", "if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end", "1", lockKey, token]])
       .catch(() => console.warn("机器操作锁释放失败，将在到期后自动释放"));
@@ -153,11 +203,15 @@ async function withMachineLock(env, key, action) {
 }
 
 /** 追加一条日志并裁剪到最近 LOG_KEEP 条 */
-function addLog(env, entry) {
-  return redis(env, [
+function logCommands(entry) {
+  return [
     ["LPUSH", REDIS_PREFIX + ":logs", JSON.stringify(entry)],
     ["LTRIM", REDIS_PREFIX + ":logs", "0", String(LOG_KEEP - 1)],
-  ]);
+  ];
+}
+
+function addLog(env, entry) {
+  return redis(env, logCommands(entry));
 }
 
 // ---------- InstaBox API ----------
@@ -168,11 +222,10 @@ async function ib(env, account, method, path, body, idempotencyKey) {
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   try {
-    const res = await fetch((env.INSTABOX_API_ORIGIN || API_ORIGIN) + path, {
+    const res = await budgetFetch(env, (env.INSTABOX_API_ORIGIN || API_ORIGIN) + path, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     const data = res.status === 204 ? null : await res.json().catch(() => null);
     return {
@@ -186,7 +239,7 @@ async function ib(env, account, method, path, body, idempotencyKey) {
     // 区分超时与连接失败，并带上底层错误码（如 ENOTFOUND=域名解析失败、ECONNRESET=连接被重置）
     const timedOut = e && (e.name === "TimeoutError" || e.name === "AbortError");
     const cause = (e && (e.cause?.code || e.code)) || "";
-    const message = timedOut ? "请求超时" : "网络错误";
+    const message = timedOut ? "请求超时" : safeMessage(e?.message || "网络错误");
     return { ok: false, status: 0, data: null, code: "network", message: cause ? message + "（" + cause + "）" : message };
   }
 }
@@ -259,14 +312,15 @@ async function renewLease(env, account, machineId) {
 async function keepAliveOnce(env, account, machineId, config, action) {
   const result = await renewLease(env, account, machineId);
   const now = new Date().toISOString();
-  await saveConfig(env, account.id, machineId, {
+  const updated = {
     ...config, lastStatus: result.state, lastDetail: result.detail,
     // 一次失败不抹掉仍有效的旧租约；机器冷却／等待恢复时不再声称持有租约。
     leaseExpiresAt: result.expiresAt || (result.state === "failed" ? config.leaseExpiresAt || null : null),
     cooldownUntil: result.cooldownUntil || null, lastAt: now,
-  });
-  await addLog(env, { t: now, accountId: account.id, accountName: account.name, machineId,
-    name: config.name || machineId, action, ok: result.state !== "failed", detail: result.detail });
+  };
+  const entry = { t: now, accountId: account.id, accountName: account.name, machineId,
+    name: config.name || machineId, action, ok: result.state !== "failed", detail: result.detail };
+  await redis(env, [...configCommands(account.id, machineId, updated), ...logCommands(entry)]);
   return result;
 }
 
@@ -305,8 +359,38 @@ function timingSafeEqual(a, b) {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
   });
+}
+
+/** 仅申请所选机器的官方终端票据；浏览器永远不接收账号 API Key。 */
+async function terminalAccess(request, env, account, machineId) {
+  const origin = request.headers.get("Origin");
+  if (origin && origin !== new URL(request.url).origin) return json({ error: "请从本面板打开终端" }, 403);
+  const current = await ib(env, account, "GET", "/v1/machines/" + machineId);
+  if (!current.ok) return json({ error: failure(current, "读取终端机器失败").detail }, current.status === 404 ? 404 : current.status === 403 ? 403 : 502);
+  if (current.data?.id !== machineId) return json({ error: "机器状态响应无效" }, 502);
+  const guard = machineGuard(current.data);
+  if (guard) return json({ error: guard.detail, cooldownUntil: guard.cooldownUntil || null }, 409);
+  if (current.data.state !== "running" || current.data.runtime?.ready === false) {
+    return json({ error: "机器尚未运行就绪，请先启动或唤醒后重试" }, 409);
+  }
+  const access = await ib(env, account, "POST", "/v1/machines/" + machineId + "/access", { kind: "terminal", requireTicket: true });
+  if (!access.ok) return json({ error: failure(access, "申请终端会话失败").detail }, access.status === 403 ? 403 : access.status === 409 ? 409 : 502);
+  const data = access.data;
+  let target;
+  try { target = new URL(data?.url); } catch { return json({ error: "官方终端返回了无效连接地址" }, 502); }
+  // 只接受官方服务地址，不允许把凭据带到第三方或降级为明文 WebSocket。
+  if (target.protocol !== "wss:" || !(target.hostname === "instabox.sh" || target.hostname.endsWith(".instabox.sh")) ||
+      target.username || target.password || target.port || target.search || target.hash ||
+      target.pathname !== "/v1/machines/" + machineId + "/terminal") {
+    return json({ error: "官方终端连接地址不受支持" }, 502);
+  }
+  if (typeof data.token !== "string" || !/^[A-Za-z0-9._~-]{8,4096}$/.test(data.token) || data.token.startsWith("ibk_") ||
+      (data.protocol && data.protocol !== "instabox-access.v1")) {
+    return json({ error: "官方未返回可用的浏览器终端票据，请检查 API 权限或服务端版本" }, 502);
+  }
+  return json({ url: target.href, token: data.token, protocol: "instabox-access.v1" });
 }
 
 /** 处理面板的全部 API 请求 */
@@ -326,6 +410,13 @@ async function handleApi(request, env, url) {
   }
 
   const accounts = getAccounts(env);
+  const terminal = path.match(/^\/accounts\/([a-z0-9][a-z0-9_-]{0,31})\/machines\/(m_[A-Za-z0-9_-]+)\/terminal$/);
+  if (terminal) {
+    if (method !== "POST") return json({ error: "终端会话须使用 POST 创建" }, 405);
+    const account = accounts.find((a) => a.id === terminal[1]);
+    if (!account) return json({ error: "账号未配置" }, 404);
+    return terminalAccess(request, env, account, terminal[2]);
+  }
   if (path === "/machines" && method === "GET") {
     let configs = {}, configError = null;
     try { configs = await loadConfigs(env); }
@@ -343,7 +434,13 @@ async function handleApi(request, env, url) {
         keepalive: configs[configKey(account.id, m.id)] || null,
       }));
     });
-    return json({ machines, configError, accountErrors, accountCount: accounts.length, intervalMinutes: intervalMinutes(env) });
+    const enabled = Object.entries(configs).filter(([key, config]) => config.keepalive === "on" && accounts.some((account) => key.startsWith(account.id + ":"))).length;
+    const conservativeBatchSize = Math.floor((subrequestLimit(env) - 1) / MACHINE_REQUEST_RESERVE);
+    const estimatedCycleMinutes = Math.ceil(enabled / conservativeBatchSize) * intervalMinutes(env);
+    const capacityWarning = estimatedCycleMinutes > 45
+      ? "已开启 " + enabled + " 台保活，按当前间隔分批检查可能需要 " + estimatedCycleMinutes + " 分钟；建议缩短 Cron 间隔或拆分面板，为 1 小时租约留出重试时间。" : null;
+    return json({ machines, configError, accountErrors, accountCount: accounts.length, intervalMinutes: intervalMinutes(env),
+      capacity: { enabled, conservativeBatchSize, estimatedCycleMinutes, warning: capacityWarning } });
   }
 
   if (path === "/usage" && method === "GET") {
@@ -370,9 +467,8 @@ async function handleApi(request, env, url) {
   if (action === "keepalive" && typeof input?.enable !== "boolean") return json({ error: "enable 必须是布尔值" }, 400);
   const name = typeof input?.name === "string" && input.name ? input.name : machineId;
   const key = configKey(account.id, machineId);
-  const result = await withMachineLock(env, key, async () => {
-    const configs = await loadConfigs(env);
-    const config = configs[key] || {};
+  const result = await withMachineLock(env, key, async (latest) => {
+    const config = latest || {};
     const log = (label, ok, detail) => addLog(env, {
       t: new Date().toISOString(), accountId: account.id, accountName: account.name,
       machineId, name, action: label, ok, detail,
@@ -425,20 +521,27 @@ async function handleApi(request, env, url) {
 async function runKeepaliveTick(env) {
   const accounts = new Map(getAccounts(env).map((account) => [account.id, account]));
   if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) throw new Error("未配置 Upstash Redis");
-  const configs = await loadConfigs(env);
-  const targets = Object.entries(configs).filter(([, c]) => c.keepalive === "on");
-  const counts = { renewed: 0, cooldown: 0, waiting: 0, skipped: 0, failed: 0, total: targets.length };
-  for (const [key] of targets) {
+  const [raw, cursor] = await redis(env, [["HGETALL", REDIS_PREFIX + ":machines"], ["GET", CURSOR_KEY]]);
+  const configs = parseConfigs(raw);
+  const enabled = Object.entries(configs).filter(([, c]) => c.keepalive === "on");
+  const targets = enabled.filter(([key]) => accounts.has(key.split(":")[0])).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  const start = targets.findIndex(([key]) => !cursor || key > cursor);
+  const ordered = start > 0 ? [...targets.slice(start), ...targets.slice(0, start)] : targets;
+  const counts = { renewed: 0, cooldown: 0, waiting: 0, skipped: enabled.length - targets.length,
+    failed: 0, total: enabled.length, processed: 0, deferred: 0 };
+  const context = env[REQUEST_CONTEXT];
+  for (const [key] of ordered) {
+    // 为一台机器的最坏请求路径预留额度；剩余任务由持久化游标交给下一轮。
+    if (context.used + MACHINE_REQUEST_RESERVE > context.limit ||
+        context.deadline - Date.now() < MACHINE_REQUEST_RESERVE * REQUEST_TIMEOUT_MS + 5000) break;
     const [accountId, machineId] = key.split(":");
     const account = accounts.get(accountId);
-    if (!account) { counts.skipped++; continue; }
+    counts.processed++;
     try {
-      const result = await withMachineLock(env, key, async () => {
-        // 重新读取，避免在本轮开始后用户关闭保活，而旧快照又把它打开。
-        const latest = (await loadConfigs(env))[key];
+      const result = await withMachineLock(env, key, async (latest) => {
         if (!latest || latest.keepalive !== "on") return { state: "skipped" };
         return keepAliveOnce(env, account, machineId, latest, "自动保活");
-      });
+      }, true);
       if (result.locked || result.state === "skipped") counts.skipped++;
       else if (result.state === "ok") counts.renewed++;
       else if (result.state === "cooldown") counts.cooldown++;
@@ -450,7 +553,8 @@ async function runKeepaliveTick(env) {
         machineId, name: configs[key].name || machineId, action: "自动保活", ok: false, detail: safeMessage(e.message) }).catch(() => {});
     }
   }
-  return counts;
+  counts.deferred = targets.length - counts.processed;
+  return { ...counts, requests: context.used };
 }
 
 // ---------- Worker 入口 ----------
@@ -460,7 +564,7 @@ export default {
     // 兜底：任何未预期的异常都以 JSON 返回，避免裸 500 页面
     try {
       const url = new URL(request.url);
-      if (url.pathname.startsWith("/api")) return await handleApi(request, env, url);
+      if (url.pathname.startsWith("/api")) return await handleApi(request, scopedEnv(env), url);
       if (url.pathname === "/" || url.pathname === "/index.html") {
         return new Response(renderPage(), { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
       }
@@ -474,7 +578,7 @@ export default {
     try {
       const expectedCron = "*/" + intervalMinutes(env) + " * * * *";
       if (controller.cron && controller.cron !== expectedCron) console.warn("Cron 与 KEEPALIVE_INTERVAL_MINUTES 不一致，页面预计时间可能不准确");
-      const result = await runKeepaliveTick(env);
+      const result = await runKeepaliveTick(scopedEnv(env, true));
       console.log(JSON.stringify({ event: "keepalive_tick_ok", ...result }));
     } catch (error) {
       console.error(JSON.stringify({ event: "keepalive_tick_failed", message: safeMessage(error.message) }));
@@ -741,6 +845,32 @@ function renderPage() {
   .btn.danger-solid { background: var(--red); color: #fff; }
   .btn.danger-solid:hover:not(:disabled) { background: #e0352b; }
 
+  /* ---------- 机器终端 ---------- */
+  .terminal-dialog {
+    width: min(1120px, calc(100vw - 32px)); height: min(780px, calc(100dvh - 48px));
+    max-width: none; max-height: none; margin: auto; padding: 0;
+    border: 1px solid #34383f; border-radius: 14px; color: #e6edf3; background: #11151b;
+    box-shadow: 0 24px 90px rgba(0,0,0,.4);
+  }
+  .terminal-dialog::backdrop { background: rgba(0,0,0,.45); backdrop-filter: blur(3px); }
+  .terminal-layout { height: 100%; display: flex; flex-direction: column; min-height: 0; }
+  .terminal-head { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid #30363d; }
+  .terminal-heading { min-width: 0; flex: 1; }
+  .terminal-heading h2 { font-size: 15px; margin: 0 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .terminal-status { font-size: 12px; color: #adb8c5; overflow-wrap: anywhere; }
+  .terminal-status.error { color: #ffaaa4; }
+  .terminal-controls { display: flex; flex-wrap: wrap; gap: 7px; }
+  .terminal-dialog .btn { background: #242b35; color: #e6edf3; }
+  .terminal-dialog .btn:hover:not(:disabled) { background: #35404e; }
+  .terminal-screen { flex: 1; min-width: 0; min-height: 0; padding: 12px 8px 8px 14px; overflow: hidden; }
+  .terminal-foot { padding: 8px 16px; font-size: 11px; color: #adb8c5; border-top: 1px solid #30363d; }
+  @media (max-width: 640px) {
+    .terminal-dialog { width: 100vw; height: 100dvh; border-radius: 0; border: 0; }
+    .terminal-head { flex-wrap: wrap; padding: 10px 12px; }
+    .terminal-heading { flex-basis: 100%; }
+    .terminal-screen { padding: 8px; }
+  }
+
   .logs-head .tools { display: flex; align-items: center; gap: 10px; }
   .logs-head .btn { min-height: 26px; padding: 3px 11px; font-size: 11.5px; }
 
@@ -820,6 +950,25 @@ function renderPage() {
 </div>
 
 <div id="toast" class="toast"></div>
+
+<dialog id="terminalDialog" class="terminal-dialog" aria-labelledby="terminalTitle">
+  <div class="terminal-layout">
+    <header class="terminal-head">
+      <div class="terminal-heading">
+        <h2 id="terminalTitle">终端</h2>
+        <div id="terminalStatus" class="terminal-status" role="status" aria-live="polite">未连接</div>
+      </div>
+      <div class="terminal-controls">
+        <button id="terminalPaste" class="btn" disabled>粘贴</button>
+        <button id="terminalInterrupt" class="btn" disabled title="发送 Ctrl+C">Ctrl+C</button>
+        <button id="terminalReconnect" class="btn" disabled>重连</button>
+        <button id="terminalClose" class="btn" aria-label="关闭终端">关闭</button>
+      </div>
+    </header>
+    <div id="terminalScreen" class="terminal-screen" aria-label="交互式终端"></div>
+    <footer id="terminalFoot" class="terminal-foot">长任务建议使用 tmux；关闭窗口后请核对任务状态。</footer>
+  </div>
+</dialog>
 
 <script>
 "use strict";
@@ -1003,6 +1152,7 @@ function switchTab(name, skipReload) {
   if (!isMachines && !skipReload) loadAll();
 }
 function logout() {
+  closeTerminal();
   localStorage.removeItem("ib_auth");
   AUTH = "";
   showLogin();
@@ -1045,11 +1195,14 @@ function loadAll() {
   return Promise.allSettled([api("/machines"), api("/logs"), api("/usage")]).then(function (results) {
     firstLoad = false;
     var problems = [];
+    var warnings = [];
 
     if (results[0].status === "fulfilled") {
       DATA.machines = results[0].value.machines || [];
       DATA.accountCount = results[0].value.accountCount || 1;
       CRON_MINUTES = results[0].value.intervalMinutes || 15;
+      DATA.capacity = results[0].value.capacity || null;
+      if (DATA.capacity && DATA.capacity.warning) warnings.push(DATA.capacity.warning);
       (results[0].value.accountErrors || []).forEach(function (item) { problems.push(item.accountName + "：" + item.error); });
       if (results[0].value.configError) problems.push("保活配置读取失败：" + results[0].value.configError);
     } else {
@@ -1066,8 +1219,9 @@ function loadAll() {
     render();
 
     var notice = document.getElementById("notice");
-    if (problems.length) {
-      notice.textContent = problems.join("；");
+    var notices = problems.concat(warnings);
+    if (notices.length) {
+      notice.textContent = notices.join("；");
       notice.className = "notice show";
     } else {
       notice.className = "notice";
@@ -1145,7 +1299,7 @@ function renderCard(m) {
   var stateText = cooling ? "冷却中" : (STATE_TEXT[m.state] || m.state);
   var pillClass = cooling ? "suspended" : (STATE_PILL[m.state] || "busy");
 
-  // 保活状态：上次 / 下次保活时间 + 租约剩余
+  // 显示上一轮结果及下一轮全局调度；分批时本机可能在后续轮次处理
   var timeRows = "";
   if (ka.lastAt) {
     timeRows += '<div class="time-row"><span>上次检查</span><b>' + esc(fmtCN(ka.lastAt)) + '</b></div>';
@@ -1154,7 +1308,7 @@ function renderCard(m) {
     timeRows += '<div class="time-row"><span>冷却结束</span><b>' + esc(fmtCN(m.cooldownUntil)) + '</b></div>';
   }
   if (on) {
-    timeRows += '<div class="time-row"><span>' + (cooling ? '预计重试' : '下次检查') + '</span><b>' + esc(fmtCN(nextTickAt(cooling ? m.cooldownUntil : null))) + '</b></div>';
+    timeRows += '<div class="time-row"><span>' + (cooling ? '冷却后首轮' : '下轮调度') + '</span><b>' + esc(fmtCN(nextTickAt(cooling ? m.cooldownUntil : null))) + '</b></div>';
   }
 
   var stateLine;
@@ -1183,6 +1337,9 @@ function renderCard(m) {
     return '<button class="btn" data-act="' + a[0] + '" data-id="' + esc(m.key) + '"' +
       (unavailable ? ' disabled data-unavailable title="等待冷却或当前操作结束"' : dis) + '>' + a[1] + '</button>';
   }).join("");
+  var terminalDisabled = m.state !== "running" || cooling || !!m.operationId;
+  btns = '<button class="btn" data-terminal="' + esc(m.key) + '"' +
+    (terminalDisabled ? ' disabled data-unavailable title="机器运行就绪后可连接终端"' : dis) + '>终端</button>' + btns;
   btns += '<button class="btn danger" data-del="' + esc(m.key) + '" data-name="' + esc(m.name) + '"' + dis + '>删除</button>';
 
   var spec = "";
@@ -1212,6 +1369,203 @@ function renderCard(m) {
     '</div>' +
   '</div>';
 }
+
+// ---------- 官方 PTY 终端（按需加载 xterm.js） ----------
+var TERMINAL = null;
+var TERMINAL_IDS = {};
+var terminalAssets = null;
+
+function loadTerminalAsset(url, integrity, style) {
+  return new Promise(function (resolve, reject) {
+    var el = document.createElement(style ? "link" : "script");
+    if (style) { el.rel = "stylesheet"; el.href = url; } else { el.src = url; el.async = true; }
+    el.integrity = integrity;
+    el.crossOrigin = "anonymous";
+    var timer = setTimeout(function () { fail(); }, 20000);
+    function fail() {
+      clearTimeout(timer); el.remove();
+      reject(new Error("终端组件加载失败，请检查网络后重连"));
+    }
+    el.onload = function () { clearTimeout(timer); resolve(); };
+    el.onerror = fail;
+    document.head.appendChild(el);
+  });
+}
+
+function loadTerminalAssets() {
+  if (!terminalAssets) {
+    terminalAssets = Promise.all([
+      loadTerminalAsset("https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js", "sha384-M169f14mRZOXm3hD/v2Ti0ThIT/RnAQagXA9nlE15yHAtrW19gdePJh/HaTzUOe/", false),
+      loadTerminalAsset("https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css", "sha384-8Xk9wy/gzEDUKrXtrmCFa2bBuK3BpjpDuL/p0SeKQX19Khl/M+lHOgD/CyYf7efP", true),
+      loadTerminalAsset("https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js", "sha384-iF+jqbuti4XlB64clWgFWYEscb+UnSRv3VgVikGYZu+otNFnSHr7y7NcKfBnGizn", false)
+    ]).then(function () {
+      if (!window.Terminal || !window.FitAddon) throw new Error("终端组件不可用，请重连");
+    }).catch(function (error) { terminalAssets = null; throw error; });
+  }
+  return terminalAssets;
+}
+
+function terminalStatus(s, text, error, connecting) {
+  if (TERMINAL !== s) return;
+  var status = document.getElementById("terminalStatus");
+  status.textContent = text;
+  status.className = "terminal-status" + (error ? " error" : "");
+  document.getElementById("terminalReconnect").disabled = !!connecting;
+  var connected = !!s.ws && s.ws.readyState === WebSocket.OPEN;
+  document.getElementById("terminalPaste").disabled = !connected;
+  document.getElementById("terminalInterrupt").disabled = !connected;
+}
+
+function terminalSend(s, data) {
+  if (TERMINAL !== s || !s.ws || s.ws.readyState !== WebSocket.OPEN) return;
+  if (s.ws.bufferedAmount > 1024 * 1024 || data.length > 1024 * 1024) {
+    terminalStatus(s, "输入过快或粘贴过大，请稍后分段输入", true, false); return;
+  }
+  s.ws.send(data);
+}
+
+function terminalSize(s) {
+  if (s.term) terminalSend(s, JSON.stringify({ type: "resize", cols: s.term.cols, rows: s.term.rows }));
+}
+
+function closeTerminal() {
+  var s = TERMINAL;
+  TERMINAL = null;
+  if (s) {
+    s.seq++;
+    clearTimeout(s.timeout); clearTimeout(s.resizeTimer);
+    if (s.observer) s.observer.disconnect();
+    if (s.ws) { s.ws.onclose = s.ws.onmessage = s.ws.onopen = s.ws.onerror = null; s.ws.close(); }
+    if (s.term) s.term.dispose();
+  }
+  var dialog = document.getElementById("terminalDialog");
+  if (dialog.open) dialog.close();
+  document.getElementById("terminalScreen").textContent = "";
+  if (s && s.returnFocus && s.returnFocus.isConnected) s.returnFocus.focus();
+}
+
+function connectTerminal(s) {
+  var seq = ++s.seq;
+  clearTimeout(s.timeout);
+  if (s.ws) { s.ws.onclose = s.ws.onmessage = s.ws.onopen = s.ws.onerror = null; s.ws.close(); s.ws = null; }
+  terminalStatus(s, "连接中…", false, true);
+  loadTerminalAssets().then(function () {
+    if (TERMINAL !== s || seq !== s.seq) return null;
+    if (!s.term) {
+      s.term = new window.Terminal({ cursorBlink: true, scrollback: 3000, fontSize: 13,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+        theme: { background: "#11151b", foreground: "#e6edf3", cursor: "#ffffff", selectionBackground: "#3b4d66" } });
+      s.fit = new window.FitAddon.FitAddon();
+      s.term.loadAddon(s.fit);
+      s.term.open(document.getElementById("terminalScreen"));
+      s.term.onData(function (data) { terminalSend(s, new TextEncoder().encode(data)); });
+      s.term.onBinary(function (data) { terminalSend(s, Uint8Array.from(data, function (c) { return c.charCodeAt(0) & 255; })); });
+      s.term.onResize(function () { terminalSize(s); });
+      s.term.attachCustomKeyEventHandler(function (event) {
+        if (event.type === "keydown" && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "c" && s.term.hasSelection()) {
+          if (navigator.clipboard) navigator.clipboard.writeText(s.term.getSelection()).catch(function () {});
+          return false;
+        }
+        return true;
+      });
+      s.observer = new ResizeObserver(function () {
+        clearTimeout(s.resizeTimer);
+        s.resizeTimer = setTimeout(function () {
+          if (TERMINAL === s && s.fit) { try { s.fit.fit(); } catch (_) {} }
+        }, 80);
+      });
+      s.observer.observe(document.getElementById("terminalScreen"));
+    }
+    s.fit.fit();
+    return api(machinePath(s.key) + "/terminal", { method: "POST", body: "{}" });
+  }).then(function (access) {
+    if (!access || TERMINAL !== s || seq !== s.seq) return;
+    var url = new URL(access.url);
+    url.searchParams.set("cols", s.term.cols);
+    url.searchParams.set("rows", s.term.rows);
+    url.searchParams.set("session", s.session);
+    // 终端不改变机器生命周期；暂停或冷却时由用户回到卡片操作。
+    url.searchParams.set("wake", "0");
+    var ws = new WebSocket(url.href, [access.protocol, "instabox-access-token." + access.token]);
+    s.ws = ws;
+    ws.binaryType = "arraybuffer";
+    var note = "连接已断开，请检查机器状态后重连";
+    var failed = true;
+    function live() { return TERMINAL === s && seq === s.seq && s.ws === ws; }
+    s.timeout = setTimeout(function () {
+      if (!live() || ws.readyState === WebSocket.OPEN) return;
+      note = "连接超时，请检查机器状态后重连";
+      ws.close(); terminalStatus(s, note, true, false);
+    }, 20000);
+    ws.onopen = function () {
+      if (!live()) { ws.close(); return; }
+      clearTimeout(s.timeout);
+      s.term.reset(); terminalSize(s);
+      terminalStatus(s, "已连接", false, false); s.term.focus();
+    };
+    ws.onmessage = function (event) {
+      if (!live()) return;
+      if (typeof event.data !== "string") { s.term.write(new Uint8Array(event.data)); return; }
+      var message;
+      try { message = JSON.parse(event.data); } catch (_) { return; }
+      if (message.type === "session") {
+        s.term.reset();
+        document.getElementById("terminalFoot").textContent = message.persistent
+          ? "此页重连可恢复会话；长任务仍建议使用 tmux。"
+          : "此会话不保留；长任务建议使用 tmux 或后台任务。";
+      }
+      if (message.type === "exit") { note = "Shell 已退出（" + (message.code || 0) + "）"; failed = false; }
+      if (message.type === "taken") { note = "会话已在其他连接中打开"; failed = false; }
+      if (message.type === "error") { note = typeof message.message === "string" ? message.message.slice(0,300) : "终端服务返回错误"; }
+      if (["exit", "taken", "error"].indexOf(message.type) !== -1) { ws.close(); terminalStatus(s, note, failed, false); }
+    };
+    ws.onerror = function () { if (live()) terminalStatus(s, "终端连接失败，请检查网络、机器状态或票据权限", true, false); };
+    ws.onclose = function () {
+      if (!live()) return;
+      clearTimeout(s.timeout); s.ws = null;
+      terminalStatus(s, note, failed, false);
+    };
+  }).catch(function (error) {
+    if (TERMINAL === s && seq === s.seq) terminalStatus(s, error.message || "终端连接失败", true, false);
+  });
+}
+
+function openTerminal(key, button) {
+  var machine = DATA.machines.find(function (m) { return m.key === key; });
+  if (!machine || machine.state !== "running" || machine.operationId || Date.parse(machine.cooldownUntil) > Date.now()) {
+    toast("请等待机器运行就绪后再打开终端", true); return;
+  }
+  closeTerminal();
+  if (!TERMINAL_IDS[key]) TERMINAL_IDS[key] = "panel-" + crypto.randomUUID().split("-").join("").slice(0, 26);
+  var s = { key: key, session: TERMINAL_IDS[key], seq: 0, ws: null, term: null, returnFocus: button };
+  TERMINAL = s;
+  document.getElementById("terminalTitle").textContent = machine.name + " · " + machine.accountName;
+  document.getElementById("terminalFoot").textContent = "长任务建议使用 tmux；关闭窗口后请核对任务状态。";
+  document.getElementById("terminalDialog").showModal();
+  connectTerminal(s);
+}
+
+document.getElementById("machines").addEventListener("click", function (event) {
+  var button = event.target.closest("[data-terminal]");
+  if (button && !button.disabled) openTerminal(button.dataset.terminal, button);
+});
+document.getElementById("terminalClose").addEventListener("click", closeTerminal);
+document.getElementById("terminalDialog").addEventListener("close", closeTerminal);
+// Escape 属于终端程序（例如 vim），不把它解释为关闭弹窗。
+document.getElementById("terminalDialog").addEventListener("cancel", function (event) { event.preventDefault(); });
+document.getElementById("terminalReconnect").addEventListener("click", function () { if (TERMINAL) connectTerminal(TERMINAL); });
+document.getElementById("terminalInterrupt").addEventListener("click", function () {
+  if (TERMINAL) { terminalSend(TERMINAL, new Uint8Array([3])); TERMINAL.term.focus(); }
+});
+document.getElementById("terminalPaste").addEventListener("click", function () {
+  var s = TERMINAL;
+  if (!s || !s.term) return;
+  if (!navigator.clipboard) { terminalStatus(s, "请使用系统粘贴快捷键", true, false); return; }
+  navigator.clipboard.readText().then(function (text) {
+    if (TERMINAL === s) { s.term.paste(text); s.term.focus(); }
+  }).catch(function () { terminalStatus(s, "无法读取剪贴板，请使用系统粘贴快捷键", true, false); });
+});
+if (typeof window !== "undefined") window.addEventListener("pagehide", closeTerminal);
 
 // ---------- 操作 ----------
 function lifecycle(id, action, btn) {
