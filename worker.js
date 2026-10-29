@@ -11,6 +11,7 @@
  *   INSTABOX_API_KEY        InstaBox 的 API 密钥（ibk_ 开头）
  *   INSTABOX_API_KEY_1 / _2 / ... 每个账号一个 Secret，自动发现其全部机器
  *   INSTABOX_ACCOUNTS       可选 JSON 数组：[{ id, name, apiKey }]
+ *   ACCOUNT_ENCRYPTION_KEY 可选 64 位十六进制 Secret，开启网页添加账号并加密存储 Key
  *   KEEPALIVE_INTERVAL_MINUTES 定时任务分钟步长，默认 15，须与 Cron 一致
  *   WORKER_SUBREQUEST_LIMIT 单次执行请求预算，默认 50（免费套餐）
  *   ADMIN_PASSWORD          面板登录密码
@@ -33,8 +34,10 @@ const PENDING_STATES = new Set(["creating", "starting", "stopping", "suspending"
 const REQUEST_CONTEXT = Symbol("requestContext");
 const MACHINE_REQUEST_RESERVE = 11; // 含最多三次启动查询、409 重查、写回、解锁及异常日志
 const CURSOR_KEY = REDIS_PREFIX + ":scheduler-cursor";
+const MANAGED_ACCOUNTS_KEY = REDIS_PREFIX + ":accounts:v1";
+const MAX_MANAGED_ACCOUNTS = 32;
 
-function getAccounts(env) {
+function getAccounts(env, allowEmpty = false) {
   const accounts = [];
   if (env.INSTABOX_API_KEY) accounts.push({ id: "default", name: "默认账号", apiKey: env.INSTABOX_API_KEY });
   for (const variable of Object.keys(env).filter((key) => key.startsWith("INSTABOX_API_KEY_")).sort()) {
@@ -49,7 +52,7 @@ function getAccounts(env) {
     if (!Array.isArray(configured)) throw new Error("INSTABOX_ACCOUNTS 必须是 JSON 数组");
     accounts.push(...configured);
   }
-  if (!accounts.length) throw new Error("请在 Cloudflare Secrets 添加 INSTABOX_API_KEY_1，每个账号填写一个 Key");
+  if (!accounts.length && !allowEmpty) throw new Error("请在 Cloudflare Secrets 添加 INSTABOX_API_KEY_1，每个账号填写一个 Key");
   const ids = new Set(), keys = new Set();
   return accounts.map((account, index) => {
     if (!account || typeof account.id !== "string" || !ACCOUNT_RE.test(account.id) || typeof account.apiKey !== "string" || !KEY_RE.test(account.apiKey)) {
@@ -60,6 +63,144 @@ function getAccounts(env) {
     ids.add(account.id); keys.add(account.apiKey);
     return { id: account.id, name: account.name || account.id, apiKey: account.apiKey };
   });
+}
+
+function accountRegistrationEnabled(env) {
+  return typeof env.ACCOUNT_ENCRYPTION_KEY === "string" && /^[a-fA-F0-9]{64}$/.test(env.ACCOUNT_ENCRYPTION_KEY);
+}
+
+async function accountCryptoKey(env) {
+  if (!accountRegistrationEnabled(env)) throw new Error("网页账号存储的加密配置无效");
+  const bytes = Uint8Array.from(env.ACCOUNT_ENCRYPTION_KEY.match(/../g), (hex) => parseInt(hex, 16));
+  return crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+function encodeBytes(bytes) { return btoa(String.fromCharCode(...new Uint8Array(bytes))); }
+function decodeBytes(value, maxLength) {
+  if (typeof value !== "string" || value.length > maxLength || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) throw new Error("无效密文");
+  return Uint8Array.from(atob(value), (c) => c.charCodeAt(0));
+}
+
+async function managedAccountId(orgId) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(orgId));
+  return "web_" + Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, "0")).join("").slice(0, 24);
+}
+
+async function encryptAccount(key, account) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aad = new TextEncoder().encode(MANAGED_ACCOUNTS_KEY + ":" + account.id);
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: aad }, key, new TextEncoder().encode(JSON.stringify(account)));
+  return JSON.stringify({ version: 1, iv: encodeBytes(iv), ciphertext: encodeBytes(ciphertext) });
+}
+
+async function decryptAccount(key, id, encoded) {
+  if (!/^web_[a-f0-9]{24}$/.test(id) || typeof encoded !== "string" || encoded.length > 4096) throw new Error("无效账号记录");
+  const envelope = JSON.parse(encoded);
+  const iv = decodeBytes(envelope.iv, 24);
+  if (envelope.version !== 1 || iv.byteLength !== 12) throw new Error("无效账号密文");
+  const aad = new TextEncoder().encode(MANAGED_ACCOUNTS_KEY + ":" + id);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: aad }, key, decodeBytes(envelope.ciphertext, 4000));
+  const account = JSON.parse(new TextDecoder().decode(plain));
+  if (account.id !== id || !/^org_[A-Za-z0-9_-]+$/.test(account.orgId) || await managedAccountId(account.orgId) !== id ||
+      typeof account.apiKey !== "string" || !KEY_RE.test(account.apiKey) || account.apiKey.length > 256 ||
+      typeof account.name !== "string" || !account.name.trim() || account.name.length > 80) throw new Error("无效账号内容");
+  return { id, name: account.name, apiKey: account.apiKey, orgId: account.orgId, source: "panel" };
+}
+
+/** 未开启网页存储时不增加 Redis 请求，兼容原 Secrets-only 部署和请求预算。 */
+async function loadAccounts(env) {
+  const accounts = getAccounts(env, !!env.ACCOUNT_ENCRYPTION_KEY).map((a) => ({ ...a, source: "secret" }));
+  const errors = [];
+  if (!env.ACCOUNT_ENCRYPTION_KEY) return { accounts, errors };
+  let key, entries;
+  try {
+    key = await accountCryptoKey(env);
+    const [raw] = await redis(env, [["HGETALL", MANAGED_ACCOUNTS_KEY]]);
+    entries = Object.entries(toHash(raw));
+    if (entries.length > MAX_MANAGED_ACCOUNTS) throw new Error("账号存储超出限制");
+  } catch (_) {
+    return { accounts, errors: [{ accountId: "panel", accountName: "网页账号", error: "无法读取网页账号，请检查 Redis 和加密主密钥；原 Secrets 账号继续可用" }] };
+  }
+  for (const [id, encoded] of entries) {
+    try {
+      const account = await decryptAccount(key, id, encoded);
+      if (accounts.some((a) => a.id === id || a.apiKey === account.apiKey)) throw new Error("账号重复");
+      accounts.push(account);
+    } catch (_) {
+      errors.push({ accountId: "panel", accountName: "网页账号", error: "一条账号记录无法解密或存在配置冲突，请检查主密钥和存储记录" });
+    }
+  }
+  return { accounts, errors };
+}
+
+async function readAccountInput(request) {
+  if (!(request.headers.get("Content-Type") || "").toLowerCase().startsWith("application/json")) return null;
+  const reader = request.body?.getReader();
+  if (!reader) return null;
+  let size = 0, text = "";
+  const decoder = new TextDecoder();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 2048) { await reader.cancel(); return null; }
+      text += decoder.decode(value, { stream: true });
+    }
+    return JSON.parse(text + decoder.decode());
+  } catch (_) { return null; }
+  finally { reader.releaseLock(); }
+}
+
+async function accountOrg(env, account) {
+  const r = await ib(env, account, "GET", "/v1/orgs");
+  if (!r.ok) return { error: failure(r, "校验账号失败").detail };
+  const orgs = r.data?.orgs;
+  if (!Array.isArray(orgs) || orgs.length !== 1 || !/^org_[A-Za-z0-9_-]+$/.test(orgs[0]?.id)) {
+    return { error: "无法确认 Key 所属的唯一工作区，请使用该账号或工作区自己的 API Key" };
+  }
+  return { id: orgs[0].id, name: orgs[0].name };
+}
+
+async function registerAccount(request, env) {
+  const origin = request.headers.get("Origin");
+  if (origin && origin !== new URL(request.url).origin) return json({ error: "请从本面板添加账号" }, 403);
+  if (!accountRegistrationEnabled(env)) return json({ error: "网页添加账号尚未启用，请先配置 ACCOUNT_ENCRYPTION_KEY" }, 503);
+  const input = await readAccountInput(request);
+  if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.apiKey !== "string" ||
+      (input.name !== undefined && typeof input.name !== "string")) return json({ error: "请填写有效的 API Key 和账号名称" }, 400);
+  const apiKey = input.apiKey.trim(), name = (input.name || "").trim();
+  if (!KEY_RE.test(apiKey) || apiKey.length > 256) return json({ error: "API Key 格式不正确，应以 ibk_ 开头" }, 400);
+  if (name.length > 80 || /[\u0000-\u001f\u007f]/.test(name)) return json({ error: "账号名称须为不超过 80 字的普通文本" }, 400);
+  const { accounts, errors } = await loadAccounts(env);
+  if (errors.length) return json({ error: "账号存储暂不可用，未保存新账号；请先处理页面上的网页账号错误" }, 503);
+  if (accounts.some((a) => a.apiKey === apiKey)) return json({ error: "这个 Key 已接入，请直接刷新机器列表" }, 409);
+  const candidate = { apiKey };
+  const org = await accountOrg(env, candidate);
+  if (org.error) return json({ error: org.error }, 422);
+  for (const account of accounts) {
+    const existing = account.orgId ? { id: account.orgId } : await accountOrg(env, account);
+    if (existing.error) return json({ error: "无法校验已有账号「" + account.name + "」的归属，请先修复它的 Key 后重试" }, 503);
+    if (existing.id === org.id) return json({ error: "该账号已接入为「" + account.name + "」，无需重复添加；更换 Key 请保留原账号身份" }, 409);
+  }
+  const machines = await listMachines(env, candidate);
+  if (machines.error) return json({ error: "未保存：" + machines.error }, 422);
+  if (machines.machines.some((m) => m.orgId && m.orgId !== org.id)) return json({ error: "机器列表与账号归属不一致，未保存" }, 422);
+  const id = await managedAccountId(org.id);
+  if (accounts.some((a) => a.id === id)) return json({ error: "账号标识与现有配置冲突，未保存" }, 409);
+  const suggestedName = typeof org.name === "string" ? org.name.replace(/[\u0000-\u001f\u007f]/g, "").trim() : "";
+  const displayName = safeMessage(name || suggestedName || "账号 " + id.slice(-6)).slice(0, 80);
+  const record = { id, name: displayName, apiKey, orgId: org.id };
+  const ciphertext = await encryptAccount(await accountCryptoKey(env), record);
+  // 同一工作区固定 ID；原子地拒绝并发重复提交，绝不覆盖现有 Key。
+  const script = "if redis.call('HEXISTS',KEYS[1],ARGV[1]) == 1 then return 0 end; if redis.call('HLEN',KEYS[1]) >= tonumber(ARGV[3]) then return -1 end; redis.call('HSET',KEYS[1],ARGV[1],ARGV[2]); return 1";
+  let saved;
+  try { [saved] = await redis(env, [["EVAL", script, "1", MANAGED_ACCOUNTS_KEY, id, ciphertext, String(MAX_MANAGED_ACCOUNTS)]]); }
+  catch (_) { return json({ error: "未能确认账号是否保存，请刷新面板后重试；重复提交不会覆盖已有账号" }, 503); }
+  if (saved === 0) return json({ error: "该账号已添加，请刷新机器列表" }, 409);
+  if (saved === -1) return json({ error: "网页账号已达 32 个，请整理已有账号或拆分面板" }, 409);
+  if (saved !== 1) return json({ error: "账号存储返回异常，请刷新后检查" }, 503);
+  return json({ ok: true, account: { id, name: displayName }, machineCount: machines.machines.length }, 201);
 }
 
 function intervalMinutes(env) {
@@ -399,6 +540,11 @@ async function handleApi(request, env, url) {
   const path = url.pathname.replace(/^\/api/, "");
   const method = request.method;
   if (path === "/auth" && method === "POST") return json({ ok: true });
+  if (path === "/accounts") {
+    if (method === "GET") return json({ canAdd: accountRegistrationEnabled(env) });
+    if (method === "POST") return registerAccount(request, env);
+    return json({ error: "账号接口仅支持读取能力或添加账号" }, 405);
+  }
 
   if (path === "/logs" && method === "GET") {
     const [logs] = await redis(env, [["LRANGE", REDIS_PREFIX + ":logs", "0", "49"]]);
@@ -409,7 +555,7 @@ async function handleApi(request, env, url) {
     return json({ ok: true });
   }
 
-  const accounts = getAccounts(env);
+  const { accounts, errors: registryErrors } = await loadAccounts(env);
   const terminal = path.match(/^\/accounts\/([a-z0-9][a-z0-9_-]{0,31})\/machines\/(m_[A-Za-z0-9_-]+)\/terminal$/);
   if (terminal) {
     if (method !== "POST") return json({ error: "终端会话须使用 POST 创建" }, 405);
@@ -422,7 +568,7 @@ async function handleApi(request, env, url) {
     try { configs = await loadConfigs(env); }
     catch (e) { configError = safeMessage(e.message); }
     const lists = await Promise.all(accounts.map((account) => listMachines(env, account)));
-    const accountErrors = [];
+    const accountErrors = [...registryErrors];
     const machines = accounts.flatMap((account, index) => {
       const list = lists[index];
       if (list.error) accountErrors.push({ accountId: account.id, accountName: account.name, error: list.error });
@@ -435,7 +581,7 @@ async function handleApi(request, env, url) {
       }));
     });
     const enabled = Object.entries(configs).filter(([key, config]) => config.keepalive === "on" && accounts.some((account) => key.startsWith(account.id + ":"))).length;
-    const conservativeBatchSize = Math.floor((subrequestLimit(env) - 1) / MACHINE_REQUEST_RESERVE);
+    const conservativeBatchSize = Math.floor((subrequestLimit(env) - (env.ACCOUNT_ENCRYPTION_KEY ? 2 : 1)) / MACHINE_REQUEST_RESERVE);
     const estimatedCycleMinutes = Math.ceil(enabled / conservativeBatchSize) * intervalMinutes(env);
     const capacityWarning = estimatedCycleMinutes > 45
       ? "已开启 " + enabled + " 台保活，按当前间隔分批检查可能需要 " + estimatedCycleMinutes + " 分钟；建议缩短 Cron 间隔或拆分面板，为 1 小时租约留出重试时间。" : null;
@@ -445,7 +591,7 @@ async function handleApi(request, env, url) {
 
   if (path === "/usage" && method === "GET") {
     const results = await Promise.all(accounts.map((account) => ib(env, account, "GET", "/v1/usage")));
-    const usage = {}, accountErrors = [];
+    const usage = {}, accountErrors = [...registryErrors];
     results.forEach((r, index) => {
       if (!r.ok || !r.data) { accountErrors.push({ accountName: accounts[index].name, error: failure(r, "读取配额失败").detail }); return; }
       for (const key of ["machines", "snapshots", "storageGiB"]) {
@@ -519,7 +665,9 @@ async function handleApi(request, env, url) {
 // ---------- Cron 保活任务 ----------
 
 async function runKeepaliveTick(env) {
-  const accounts = new Map(getAccounts(env).map((account) => [account.id, account]));
+  const loaded = await loadAccounts(env);
+  const accounts = new Map(loaded.accounts.map((account) => [account.id, account]));
+  if (loaded.errors.length) console.warn("网页账号加载异常，跳过不可用账号；原 Secrets 账号继续处理");
   if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) throw new Error("未配置 Upstash Redis");
   const [raw, cursor] = await redis(env, [["HGETALL", REDIS_PREFIX + ":machines"], ["GET", CURSOR_KEY]]);
   const configs = parseConfigs(raw);
@@ -845,6 +993,20 @@ function renderPage() {
   .btn.danger-solid { background: var(--red); color: #fff; }
   .btn.danger-solid:hover:not(:disabled) { background: #e0352b; }
 
+  .account-dialog {
+    width: min(420px, calc(100vw - 32px)); margin: auto; padding: 24px;
+    border: 0; border-radius: 18px; color: var(--text); background: var(--card);
+    box-shadow: 0 20px 60px rgba(0,0,0,.22);
+  }
+  .account-dialog::backdrop { background: rgba(0,0,0,.32); backdrop-filter: blur(3px); }
+  .account-dialog h2 { font-size: 18px; margin-bottom: 8px; }
+  .account-dialog .account-help { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  .account-dialog label { display: block; font-size: 13px; margin: 14px 0 7px; }
+  .account-dialog .field { font-size: 14px; }
+  .account-error { color: #b42318; font-size: 13px; overflow-wrap: anywhere; margin: 14px 0; }
+  .account-error:empty { margin: 0; }
+  .account-dialog .modal-actions { margin-top: 22px; }
+
   /* ---------- 机器终端 ---------- */
   .terminal-dialog {
     width: min(1120px, calc(100vw - 32px)); height: min(780px, calc(100dvh - 48px));
@@ -914,6 +1076,7 @@ function renderPage() {
     </nav>
     <div class="top-right">
       <span class="quota" id="quota"></span>
+      <button id="addAccountBtn" class="btn primary">添加账号</button>
       <button id="refreshBtn" class="btn">刷新</button>
       <button id="logoutBtn" class="btn">退出</button>
     </div>
@@ -950,6 +1113,22 @@ function renderPage() {
 </div>
 
 <div id="toast" class="toast"></div>
+
+<dialog id="accountDialog" class="account-dialog" aria-labelledby="accountTitle">
+  <form id="accountForm">
+    <h2 id="accountTitle">添加账号</h2>
+    <p class="account-help" id="accountHelp">验证 Key 后，自动发现该账号已有的机器。新机器默认不开启保活。</p>
+    <label for="accountKey">API Key</label>
+    <input id="accountKey" class="field" type="password" autocomplete="off" spellcheck="false" placeholder="ibk_…" maxlength="256" required aria-describedby="accountHelp accountError">
+    <label for="accountName">名称（可选）</label>
+    <input id="accountName" class="field" type="text" autocomplete="off" maxlength="80" placeholder="便于区分的账号名称">
+    <p id="accountError" class="account-error" role="alert"></p>
+    <div class="modal-actions">
+      <button id="accountCancel" type="button" class="btn">取消</button>
+      <button id="accountSubmit" type="submit" class="btn primary" disabled>验证并添加</button>
+    </div>
+  </form>
+</dialog>
 
 <dialog id="terminalDialog" class="terminal-dialog" aria-labelledby="terminalTitle">
   <div class="terminal-layout">
@@ -1152,6 +1331,7 @@ function switchTab(name, skipReload) {
   if (!isMachines && !skipReload) loadAll();
 }
 function logout() {
+  closeAccountDialog();
   closeTerminal();
   localStorage.removeItem("ib_auth");
   AUTH = "";
@@ -1199,7 +1379,7 @@ function loadAll() {
 
     if (results[0].status === "fulfilled") {
       DATA.machines = results[0].value.machines || [];
-      DATA.accountCount = results[0].value.accountCount || 1;
+      DATA.accountCount = typeof results[0].value.accountCount === "number" ? results[0].value.accountCount : 1;
       CRON_MINUTES = results[0].value.intervalMinutes || 15;
       DATA.capacity = results[0].value.capacity || null;
       if (DATA.capacity && DATA.capacity.warning) warnings.push(DATA.capacity.warning);
@@ -1566,6 +1746,81 @@ document.getElementById("terminalPaste").addEventListener("click", function () {
   }).catch(function () { terminalStatus(s, "无法读取剪贴板，请使用系统粘贴快捷键", true, false); });
 });
 if (typeof window !== "undefined") window.addEventListener("pagehide", closeTerminal);
+
+// ---------- 添加已有账号 ----------
+var ACCOUNT_FORM_BUSY = false;
+var ACCOUNT_FORM_GENERATION = 0;
+
+function closeAccountDialog() {
+  var dialog = document.getElementById("accountDialog");
+  if (dialog.open) dialog.close();
+  document.getElementById("accountKey").value = "";
+  document.getElementById("accountName").value = "";
+  ACCOUNT_FORM_GENERATION++;
+}
+
+function openAccountDialog() {
+  if (ACCOUNT_FORM_BUSY) { toast("账号仍在验证，请稍候", true); return; }
+  var generation = ++ACCOUNT_FORM_GENERATION;
+  document.getElementById("accountError").textContent = "";
+  document.getElementById("accountSubmit").disabled = true;
+  document.getElementById("accountKey").value = "";
+  document.getElementById("accountName").value = "";
+  document.getElementById("accountDialog").showModal();
+  document.getElementById("accountKey").focus();
+  api("/accounts").then(function (result) {
+    if (generation !== ACCOUNT_FORM_GENERATION) return;
+    document.getElementById("accountSubmit").disabled = !result.canAdd;
+    if (!result.canAdd) document.getElementById("accountError").textContent = "网页添加账号尚未启用，请联系面板管理员完成配置。";
+  }).catch(function (error) {
+    if (generation === ACCOUNT_FORM_GENERATION) document.getElementById("accountError").textContent = error.message;
+  });
+}
+
+document.getElementById("addAccountBtn").addEventListener("click", openAccountDialog);
+document.getElementById("accountCancel").addEventListener("click", closeAccountDialog);
+document.getElementById("accountDialog").addEventListener("cancel", function (event) {
+  if (ACCOUNT_FORM_BUSY) { event.preventDefault(); return; }
+  closeAccountDialog();
+});
+document.getElementById("accountDialog").addEventListener("close", function () {
+  document.getElementById("accountKey").value = "";
+  document.getElementById("accountName").value = "";
+  ACCOUNT_FORM_GENERATION++;
+});
+document.getElementById("accountForm").addEventListener("submit", function (event) {
+  event.preventDefault();
+  var submit = document.getElementById("accountSubmit");
+  if (ACCOUNT_FORM_BUSY || submit.disabled) return;
+  var apiKey = document.getElementById("accountKey").value.trim();
+  var name = document.getElementById("accountName").value.trim();
+  if (!/^ibk_[A-Za-z0-9_-]+$/.test(apiKey)) {
+    document.getElementById("accountError").textContent = "请输入以 ibk_ 开头的 API Key"; return;
+  }
+  ACCOUNT_FORM_BUSY = true;
+  var generation = ACCOUNT_FORM_GENERATION;
+  setBtnBusy(submit, true);
+  document.getElementById("accountCancel").disabled = true;
+  document.getElementById("accountKey").disabled = true;
+  document.getElementById("accountName").disabled = true;
+  document.getElementById("accountError").textContent = "";
+  var pending = api("/accounts", { method: "POST", body: JSON.stringify({ apiKey: apiKey, name: name }) });
+  apiKey = "";
+  pending.then(function (result) {
+    if (generation !== ACCOUNT_FORM_GENERATION || !AUTH) return;
+    closeAccountDialog();
+    toast("已添加「" + result.account.name + "」，发现 " + result.machineCount + " 台机器");
+    return loadAll();
+  }).catch(function (error) {
+    if (generation === ACCOUNT_FORM_GENERATION && AUTH) document.getElementById("accountError").textContent = error.message;
+  }).finally(function () {
+    ACCOUNT_FORM_BUSY = false;
+    setBtnBusy(submit, false);
+    document.getElementById("accountCancel").disabled = false;
+    document.getElementById("accountKey").disabled = false;
+    document.getElementById("accountName").disabled = false;
+  });
+});
 
 // ---------- 操作 ----------
 function lifecycle(id, action, btn) {
